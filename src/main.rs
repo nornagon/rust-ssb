@@ -1,4 +1,4 @@
-#![feature(async_await, await_macro, futures_api)]
+#![feature(async_await, await_macro, futures_api, pin)]
 
 #[macro_use]
 extern crate serde_json;
@@ -161,23 +161,25 @@ impl<T: AsyncWrite> AsyncWrite for WriteBoxStream<T> {
     }
 }
 
-// async fn read_box<T: AsyncRead>(b: &mut BoxStream<T>) {
-//     loop {
-//         let mut header = [0u8; 34];
-//         await!(b.stream.read_exact(&mut header)).unwrap();
-        
-//         secretbox::open(&header, &b.nonce, &b.key).unwrap();
-//         b.nonce.increment_be_inplace();
+async fn read_box<T: AsyncRead>(b: &mut ReadBoxStream<T>) -> Vec<u8> {
+    let mut header_enc = [0u8; 34];
+    await!(b.stream.read_exact(&mut header_enc)).unwrap();
+    let header = secretbox::open(&header_enc, &b.nonce, &b.key).unwrap();
+    b.nonce.increment_be_inplace();
+    let (len_buf, tag_buf) = header.split_at(2);
+    let len = std::io::Cursor::new(&len_buf[..]).read_u16::<BigEndian>().unwrap() as usize;
+    let tag = secretbox::Tag::from_slice(&tag_buf[..]).unwrap();
+    println!("opened header: len = {:?}, tag = {:?}", len, tag);
 
-//         let len = std::io::Cursor::new(&header[..]).read_u16::<BigEndian>().unwrap() as usize;
+    let mut data = Vec::with_capacity(len);
+    data.resize(len, 0);
+    await!(b.stream.read_exact(data.as_mut_slice())).unwrap();
 
-//         let mut data = Vec::with_capacity(len);
-//         data.resize(len, 0);
-//         await!(b.stream.read_exact(data.as_mut_slice())).unwrap();
+    secretbox::open_detached(&mut data, &tag, &b.nonce, &b.key).unwrap();
+    b.nonce.increment_be_inplace();
 
-//         unimplemented!()
-//     }
-// }
+    data
+}
 
 struct ReadBoxStream<T> {
     key: secretbox::Key,
@@ -200,6 +202,14 @@ impl<T: AsyncRead> AsyncRead for ReadBoxStream<T> {
         lw: &LocalWaker, 
         buf: &mut [u8]
     ) -> Poll<Result<usize, futures::io::Error>> {
+        let mut pinned = read_box(self);
+        let x = unsafe { std::pin::Pin::new_unchecked(&mut pinned) };
+        x.poll(lw).map(|x| {
+            assert!(x.len() <= buf.len());
+            buf[..x.len()].copy_from_slice(&x[..]);
+            Ok(x.len())
+        })
+        /*
         println!("poll_read buf {}", buf.len());
         // We previously decoded too many bytes for buf. Just return some of those bytes.
         if let Some(dec_buf) = &self.dec_buf {
@@ -293,11 +303,12 @@ impl<T: AsyncRead> AsyncRead for ReadBoxStream<T> {
         //self.nonce = nonce2;
 
         return Poll::Ready(Ok(to_copy));
+        */
     }
 
 }
 
-async fn foo() -> io::Result<(WriteBoxStream<impl AsyncWrite>, ReadBoxStream<impl AsyncRead>)> {
+async fn handshake() -> io::Result<(WriteBoxStream<impl AsyncWrite>, ReadBoxStream<impl AsyncRead>)> {
     let discovery = "net:192.168.2.4:8008~shs:tPF29LyiYrobdLcAZnBIRNMjAZv38qa4OXnlbKb1zN8=";
     //let discovery = "net:192.168.1.20:8008~shs:ppR/uuTDeJzHZ29jYNPvSj3RZu9Z1hciaxzMAduRAbU=";
     let config = parse_multiserver_address(discovery);
@@ -434,7 +445,7 @@ async fn foo() -> io::Result<(WriteBoxStream<impl AsyncWrite>, ReadBoxStream<imp
 
 fn main() -> () {
     executor::block_on(async {
-        let (writer, mut reader) = await!(foo()).unwrap();
+        let (writer, mut reader) = await!(handshake()).unwrap();
         loop {
             let mut buf = [0; 4096];
             let msg = await!(reader.read(&mut buf)).unwrap();
