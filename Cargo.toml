@@ -1,0 +1,16 @@
+[package]
+name = "ssb"
+version = "0.1.0"
+authors = ["Jeremy Apthorp <nornagon@nornagon.net>"]
+edition = "2018"
+
+[dependencies]
+sodiumoxide = "0.2.0"
+dirs = "1.0.4"
+serde_json = "1.0"
+base64 = "0.10.0"
+net2 = "0.2.33"
+futures-preview = "0.3.0-alpha.10"
+romio = "0.3.0-alpha.1"
+libc = "0.2.45"
+byteorder = "1"
