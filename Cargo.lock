@@ -921,6 +921,7 @@ dependencies = [
  "futures-preview 0.3.0-alpha.10 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.2.45 (registry+https://github.com/rust-lang/crates.io-index)",
  "net2 0.2.33 (registry+https://github.com/rust-lang/crates.io-index)",
+ "pin-utils 0.1.0-alpha.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "romio 0.3.0-alpha.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json 1.0.33 (registry+https://github.com/rust-lang/crates.io-index)",
  "sodiumoxide 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",

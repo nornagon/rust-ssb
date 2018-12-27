@@ -1,4 +1,4 @@
-#![feature(async_await, await_macro, futures_api, pin)]
+#![feature(async_await, await_macro, futures_api, pin, existential_type)]
 
 #[macro_use]
 extern crate serde_json;
@@ -15,6 +15,9 @@ use std::str;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use futures::task::*;
+use std::pin::{Pin, Unpin};
+use pin_utils::{unsafe_pinned, unsafe_unpinned};
+use std::io::Cursor;
 
 // use net2::UdpBuilder;
 // use net2::unix::UnixUdpBuilderExt;
@@ -98,7 +101,7 @@ fn sk_to_curve(sk: &sign::ed25519::SecretKey) -> [u8; 32] {
     result
 }
 
-struct WriteBoxStream<T: AsyncWrite> {
+struct BoxStream<T> {
     key: secretbox::Key,
     nonce: secretbox::Nonce,
 
@@ -123,7 +126,7 @@ impl NonceIncrementExt for secretbox::Nonce {
     }
 }
 
-impl<T: AsyncWrite> AsyncWrite for WriteBoxStream<T> {
+impl<T: AsyncWrite> AsyncWrite for BoxStream<T> {
     fn poll_write(
         &mut self,
         lw: &LocalWaker,
@@ -161,11 +164,11 @@ impl<T: AsyncWrite> AsyncWrite for WriteBoxStream<T> {
     }
 }
 
-async fn read_box<T: AsyncRead>(b: &mut ReadBoxStream<T>) -> Vec<u8> {
+async fn read_box<T: AsyncRead>(boxStream: &mut BoxStream<T>) -> Vec<u8> {
     let mut header_enc = [0u8; 34];
-    await!(b.stream.read_exact(&mut header_enc)).unwrap();
-    let header = secretbox::open(&header_enc, &b.nonce, &b.key).unwrap();
-    b.nonce.increment_be_inplace();
+    await!(boxStream.stream.read_exact(&mut header_enc)).unwrap();
+    let header = secretbox::open(&header_enc, &boxStream.nonce, &boxStream.key).unwrap();
+    boxStream.nonce.increment_be_inplace();
     let (len_buf, tag_buf) = header.split_at(2);
     let len = std::io::Cursor::new(&len_buf[..]).read_u16::<BigEndian>().unwrap() as usize;
     let tag = secretbox::Tag::from_slice(&tag_buf[..]).unwrap();
@@ -173,144 +176,71 @@ async fn read_box<T: AsyncRead>(b: &mut ReadBoxStream<T>) -> Vec<u8> {
 
     let mut data = Vec::with_capacity(len);
     data.resize(len, 0);
-    await!(b.stream.read_exact(data.as_mut_slice())).unwrap();
+    await!(boxStream.stream.read_exact(data.as_mut_slice())).unwrap();
 
-    secretbox::open_detached(&mut data, &tag, &b.nonce, &b.key).unwrap();
-    b.nonce.increment_be_inplace();
+    secretbox::open_detached(&mut data, &tag, &boxStream.nonce, &boxStream.key).unwrap();
+    boxStream.nonce.increment_be_inplace();
 
     data
 }
 
-struct ReadBoxStream<T> {
-    key: secretbox::Key,
-    nonce: secretbox::Nonce,
-
-    stream: T,
-
-    enc_offset: usize,
-
-    // The first 34 bytes are the encrypted header, then the rest is the encrypted payload.
-    enc_bytes: [u8; 16 + 2 + 16 + 4096],
-
-    dec_offset: usize,
-    dec_buf: Option<Vec<u8>>,
+#[derive(Debug)]
+enum MessageBody {
+    Binary(Vec<u8>),
+    Str(String),
+    Json(Value),
 }
 
-impl<T: AsyncRead> AsyncRead for ReadBoxStream<T> {
-    fn poll_read(
-        &mut self, 
-        lw: &LocalWaker, 
-        buf: &mut [u8]
-    ) -> Poll<Result<usize, futures::io::Error>> {
-        let mut pinned = read_box(self);
-        let x = unsafe { std::pin::Pin::new_unchecked(&mut pinned) };
-        x.poll(lw).map(|x| {
-            assert!(x.len() <= buf.len());
-            buf[..x.len()].copy_from_slice(&x[..]);
-            Ok(x.len())
-        })
-        /*
-        println!("poll_read buf {}", buf.len());
-        // We previously decoded too many bytes for buf. Just return some of those bytes.
-        if let Some(dec_buf) = &self.dec_buf {
-            let to_copy = std::cmp::min(dec_buf.len() - self.dec_offset, buf.len());
-            assert!(to_copy > 0);
-            buf[..to_copy].copy_from_slice(&dec_buf[self.dec_offset..self.dec_offset + to_copy]);
-            self.dec_offset += to_copy;
-            if self.dec_offset == dec_buf.len() {
-                self.dec_buf = None;
-                self.dec_offset = 0;
-            }
-            println!("returning from dec_buf");
-            return Poll::Ready(Ok(to_copy));
-        }
+#[derive(Debug)]
+struct Message {
+    end_error: bool,
+    stream: bool,
+    req_num: i32,
+    body: MessageBody,
+}
 
-        let bytes_read = match self.stream.poll_read(lw, &mut self.enc_bytes[self.enc_offset..]) {
-            Poll::Ready(Ok(bytes_read)) => {
-                bytes_read
-            },
-            // If we got an error or poll_read returned pending, do nothing.
-            result => {
-                println!("chain poll read failed {:?}", result);
-                return result;
-            }
-        };
-
-        self.enc_offset += bytes_read;
-        println!("Read {} bytes from network. {} bytes pending", bytes_read, self.enc_offset);
-        println!("Got bytes {:?}", &self.enc_bytes[34..self.enc_offset]);
-
-        // We have a chunk from enc_bytes[0] to enc_offset to try and decode.
-
-        // The header is exactly 34 bytes. If we have less than that, wait until we have more and try again.
-        if self.enc_offset < 34 { return Poll::Pending; }
-        println!("Have enough");
-
-        let (header_enc, rest) = &self.enc_bytes.split_at(34);
-        let header_dec = secretbox::open(&header_enc, &self.nonce, &self.key).unwrap();
-
-        let len = std::io::Cursor::new(&header_dec).read_u16::<BigEndian>().unwrap() as usize;
-        // let len = ((header_dec[0] as usize) << 8) | (header_dec[1] as usize); // Big endian read.
-        let body_auth_tag = &header_dec[2..];
-        assert_eq!(body_auth_tag.len(), 16);
-
-        println!("len {} bytes_read {} {:?} {:?} enc_offset {}", len, bytes_read, header_dec, self.nonce, self.enc_offset);
-
-        // Uuuummm len is actually the decrypted length. No idea if this will 100% match.
-        if self.enc_offset < 34 + len { return Poll::Pending; }
-
-        self.nonce.increment_be_inplace();
-
-        let mut data_enc = Vec::with_capacity(16 + len);
-        data_enc.extend_from_slice(body_auth_tag);
-        data_enc.extend_from_slice(&rest[..len]);
-
-        // println!("data_enc {:?}", data_enc);
-
-        // Hold off on saving the new nonce until decryption succeeds. (Not sure if this is needed...)
-        // let result = secretbox::open_detached(&mut self.enc_bytes[34..34+len],
-        //     &secretbox::Tag::from_slice(body_auth_tag).unwrap(),
-        //     &nonce2, &self.key
-        // );
-        // result.unwrap();
-
-        // self.nonce.increment_be_inplace();
-
-        // println!("nonce {:?}", self.nonce);
-        // println!("nonc2 {:?}", nonce2);
-
-        // assert_eq!(data_enc.len(), 16 + len);
-
-        //secretbox::open(data_enc.as_slice(), &nonce2, &self.key).unwrap();
-        let data_dec = match secretbox::open(data_enc.as_slice(), &self.nonce, &self.key) {
-            Err(()) => {
-                println!("Data decryption failed... promise will still be pending?");
-                return Poll::Pending;
-            }
-            Ok(data) => { data }
-        };
-        println!("Decryption succeeded: {:?}", data_dec);
-        self.nonce.increment_be_inplace();
-
-        let to_copy = std::cmp::min(len, buf.len());
-        // Copy as many bytes as we can directly.
-        buf[..to_copy].copy_from_slice(&data_dec[..to_copy]);
-        if to_copy > buf.len() {
-            self.dec_buf = Some(data_dec);
-            self.dec_offset = to_copy;
-        }
-
-        //self.nonce = nonce2;
-
-        return Poll::Ready(Ok(to_copy));
-        */
+async fn read_message<T: AsyncRead>(prev: Vec<u8>, boxStream: &mut BoxStream<T>) -> (Message, Vec<u8>) {
+    let mut buf = prev;
+    while buf.len() < 9 {
+        buf.extend(await!(read_box(boxStream)));
     }
 
+    // Read header
+    let (header, rest) = buf.split_at(9);
+    let mut cursor = Cursor::new(header);
+    let flags = cursor.read_u8().unwrap();
+    let length = cursor.read_u32::<BigEndian>().unwrap() as usize;
+    let req_num = cursor.read_i32::<BigEndian>().unwrap();
+    assert_eq!(cursor.position(), 9);
+    
+    let mut buf = Vec::from(rest);
+    // Read up to length bytes into rest
+    while buf.len() < length {
+        buf.extend(await!(read_box(boxStream)));
+    }
+
+    let (body, rest) = buf.split_at(length);
+
+    let body = match flags & 0x3 {
+        0 => { MessageBody::Binary(body.into()) }
+        1 => { MessageBody::Str(String::from_utf8(body.into()).unwrap()) }
+        2 => { MessageBody::Json(serde_json::from_str(str::from_utf8(body).unwrap()).unwrap()) }
+        n => { panic!("Unknown body type: {}", n) }
+    };
+    
+    let message = Message {
+        end_error: (flags & 0b100) != 0,
+        stream: (flags & 0b1000) != 0,
+        req_num,
+        body,
+    };
+
+    (message, Vec::from(rest))
 }
 
-async fn handshake() -> io::Result<(WriteBoxStream<impl AsyncWrite>, ReadBoxStream<impl AsyncRead>)> {
-    let discovery = "net:192.168.2.4:8008~shs:tPF29LyiYrobdLcAZnBIRNMjAZv38qa4OXnlbKb1zN8=";
-    //let discovery = "net:192.168.1.20:8008~shs:ppR/uuTDeJzHZ29jYNPvSj3RZu9Z1hciaxzMAduRAbU=";
+async fn handshake() -> io::Result<(BoxStream<impl AsyncWrite>, BoxStream<impl AsyncRead>)> {
+    //let discovery = "net:192.168.2.4:8008~shs:tPF29LyiYrobdLcAZnBIRNMjAZv38qa4OXnlbKb1zN8=";
+    let discovery = "net:192.168.1.20:8008~shs:ppR/uuTDeJzHZ29jYNPvSj3RZu9Z1hciaxzMAduRAbU=";
     let config = parse_multiserver_address(discovery);
     let (client_longterm_pk, client_longterm_sk) = sign::gen_keypair();
     let server_public_key = match config[0][1] {
@@ -425,19 +355,15 @@ async fn handshake() -> io::Result<(WriteBoxStream<impl AsyncWrite>, ReadBoxStre
 
     let (read_half, write_half) = stream.split();
 
-    let cs_bs = WriteBoxStream {
+    let cs_bs = BoxStream {
         key: secretbox::Key::from_slice(&cs_box_key[..]).unwrap(),
         nonce: secretbox::Nonce::from_slice(&hmac_server_epk[..24]).unwrap(),
         stream: write_half
     };
-    let sc_bs = ReadBoxStream {
+    let sc_bs = BoxStream {
         key: secretbox::Key::from_slice(&sc_box_key[..]).unwrap(),
         nonce: secretbox::Nonce::from_slice(&hmac_client_epk[..24]).unwrap(),
-        stream: read_half,
-        enc_offset: 0,
-        enc_bytes: [0u8; 16 + 2 + 16 + 4096],
-        dec_offset: 0,
-        dec_buf: None,
+        stream: read_half
     };
 
     Ok((cs_bs, sc_bs))
@@ -446,10 +372,16 @@ async fn handshake() -> io::Result<(WriteBoxStream<impl AsyncWrite>, ReadBoxStre
 fn main() -> () {
     executor::block_on(async {
         let (writer, mut reader) = await!(handshake()).unwrap();
+        let mut remainder = Vec::new();
         loop {
-            let mut buf = [0; 4096];
-            let msg = await!(reader.read(&mut buf)).unwrap();
-            println!("got {} bytes: {:?}", msg, buf.split_at(msg).0);
+            // let mut buf = [0u8; 4096];
+            // let msg = await!(read_box(&mut reader));
+            // println!("got bytes: {:?}", msg);
+            let (msg, r) = await!(read_message(remainder, &mut reader));
+
+            println!("got message: {:?}", msg);
+            println!("Remaining bytes: {:?}", r);
+            remainder = r;
         }
     })
 }
