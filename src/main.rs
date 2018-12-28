@@ -1,4 +1,4 @@
-#![feature(async_await, await_macro, futures_api, pin, existential_type)]
+#![feature(async_await, await_macro, futures_api, existential_type)]
 
 #[macro_use]
 extern crate serde_json;
@@ -15,8 +15,8 @@ use std::str;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use futures::task::*;
-use std::pin::{Pin, Unpin};
-use pin_utils::{unsafe_pinned, unsafe_unpinned};
+use std::pin::Pin;
+// use pin_utils::{unsafe_pinned, unsafe_unpinned};
 use std::io::Cursor;
 
 // use net2::UdpBuilder;
